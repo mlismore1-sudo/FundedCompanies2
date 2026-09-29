@@ -9,7 +9,7 @@ from typing import Any
 import asyncpg
 import httpx
 
-API_KEY = os.getenv("API_KEY", "")
+STREAM_API_KEY = os.getenv("STREAM_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 STREAMS = {
     "FILING": os.getenv("FILING_SSE_URL", "https://stream.companieshouse.gov.uk/filings"),
@@ -35,13 +35,15 @@ def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
     for source in (data, event):
         value = source.get("company_number")
         if value:
-            value = str(value)
+            value = str(value).strip().upper()
             if re.fullmatch(r"\d{8}", value) or re.fullmatch(r"[A-Z]{2}\d{6}", value):
                 return value
     for value in (event.get("resource_uri", ""), data.get("links", {}).get("self", "")):
         match = re.search(r"/company/([A-Za-z0-9]+)", value)
         if match:
-            return match.group(1)
+            candidate = match.group(1).upper()
+            if re.fullmatch(r"\d{8}", candidate) or re.fullmatch(r"[A-Z]{2}\d{6}", candidate):
+                return candidate
     return None
 
 
@@ -104,7 +106,7 @@ async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
         try:
             params = {"timepoint": last} if last else None
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", url, params=params, auth=(API_KEY, ""), headers={"Accept": "application/json"}) as response:
+                async with client.stream("GET", url, params=params, auth=(STREAM_API_KEY, ""), headers={"Accept": "application/json"}) as response:
                     if response.status_code != 200:
                         print(f"{stream} stream returned {response.status_code}", flush=True)
                         await asyncio.sleep(10)
@@ -133,8 +135,8 @@ async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
 
 
 async def main() -> None:
-    if not API_KEY:
-        raise RuntimeError("API_KEY is not set")
+    if not STREAM_API_KEY:
+        raise RuntimeError("STREAM_API_KEY is not set")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
