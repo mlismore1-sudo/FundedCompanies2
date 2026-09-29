@@ -18,8 +18,21 @@ STREAMS = {
 }
 
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_datetime() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return now_datetime()
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return now_datetime()
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
@@ -51,21 +64,23 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
     number = company_number(event, data)
     if not number or event.get("event", {}).get("type") == "deleted":
         return None
-    published = event.get("event", {}).get("published_at") or now()
+    event_meta = event.get("event") or {}
+    published = parse_timestamp(event_meta.get("published_at"))
+    event_date = data.get("date") or data.get("notified_on")
     return {
         "company_number": number,
         "company_name": data.get("company_name") or data.get("name") or data.get("linked_psc_name"),
         "event_category": event_category,
-        "event_type": event.get("event", {}).get("type"),
+        "event_type": event_meta.get("type"),
         "resource_kind": event.get("resource_kind"),
-        "resource_id": event.get("resource_id", ""),
+        "resource_id": event.get("resource_id", "") or number,
         "resource_uri": event.get("resource_uri"),
         "filing_type": data.get("type") if stream == "FILING" else None,
         "filing_description": data.get("description") if stream == "FILING" else None,
         "psc_kind": data.get("kind") if stream == "PSC" else None,
         "psc_name": data.get("name") or data.get("linked_psc_name"),
         "statement_type": data.get("statement") if stream == "PSC_STATEMENT" else None,
-        "event_date": data.get("date") or data.get("notified_on"),
+        "event_date": str(event_date) if event_date else None,
         "published_at": published,
         "raw_data": json.dumps(event),
     }
@@ -73,8 +88,12 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
 
 async def save_event(pool: asyncpg.Pool, event: dict[str, Any]) -> bool:
     result = await pool.execute("""
-        INSERT INTO company_events (company_number, company_name, event_category, event_type, resource_kind, resource_id, resource_uri, filing_type, filing_description, psc_kind, psc_name, statement_type, event_date, published_at, raw_data)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+        INSERT INTO company_events (
+            company_number, company_name, event_category, event_type,
+            resource_kind, resource_id, resource_uri, filing_type,
+            filing_description, psc_kind, psc_name, statement_type,
+            event_date, published_at, raw_data
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
         ON CONFLICT(resource_kind, resource_id, event_type) DO NOTHING
     """, event["company_number"], event.get("company_name"), event["event_category"], event.get("event_type"), event.get("resource_kind"), event["resource_id"], event.get("resource_uri"), event.get("filing_type"), event.get("filing_description"), event.get("psc_kind"), event.get("psc_name"), event.get("statement_type"), event.get("event_date"), event["published_at"], event["raw_data"])
     return result.endswith("1")
