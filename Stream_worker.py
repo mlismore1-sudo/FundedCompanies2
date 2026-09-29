@@ -1,1 +1,143 @@
+import asyncio
+import base64
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
+import aiosqlite
+import httpx
+
+API_KEY = os.getenv("API_KEY", "")
+DATABASE_FILE = os.getenv("DATABASE_FILE", "/data/companies.db")
+STREAMS = {
+    "FILING": os.getenv("FILING_SSE_URL", "https://stream.companieshouse.gov.uk/filings"),
+    "PSC": os.getenv("PSC_SSE_URL", "https://stream.companieshouse.gov.uk/persons-with-significant-control"),
+    "PSC_STATEMENT": os.getenv("PSC_STATEMENTS_SSE_URL", "https://stream.companieshouse.gov.uk/persons-with-significant-control-statements"),
+}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
+    for source in (data, event):
+        if source.get("company_number"):
+            return str(source["company_number"])
+    for value in (event.get("resource_uri", ""), data.get("links", {}).get("self", "")):
+        match = re.search(r"/company/([A-Za-z0-9]+)", value)
+        if match:
+            return match.group(1)
+    return None
+
+
+def category(stream: str, data: dict[str, Any]) -> str | None:
+    if stream == "FILING":
+        return "SH01" if data.get("type") == "SH01" else None
+    if stream == "PSC_STATEMENT":
+        return "PSC_STATEMENT"
+    kind = str(data.get("kind", "")).lower()
+    if "individual-person-with-significant-control" in kind:
+        return "NEW_INDIVIDUAL_PSC"
+    if kind in {
+        "corporate-entity-person-with-significant-control",
+        "legal-person-with-significant-control",
+    }:
+        return "NEW_RLE"
+    return None
+
+
+def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[str, Any] | None:
+    data = event.get("data") or {}
+    number = company_number(event, data)
+    if not number or event.get("event", {}).get("type") == "deleted":
+        return None
+
+    published = event.get("event", {}).get("published_at") or now()
+    return {
+        "company_number": number,
+        "company_name": data.get("company_name") or data.get("name") or data.get("linked_psc_name"),
+        "event_category": event_category,
+        "event_type": event.get("event", {}).get("type"),
+        "resource_kind": event.get("resource_kind"),
+        "resource_id": event.get("resource_id", ""),
+        "resource_uri": event.get("resource_uri"),
+        "filing_type": data.get("type") if stream == "FILING" else None,
+        "filing_description": data.get("description") if stream == "FILING" else None,
+        "psc_kind": data.get("kind") if stream == "PSC" else None,
+        "psc_name": data.get("name") or data.get("linked_psc_name"),
+        "statement_type": data.get("statement") if stream == "PSC_STATEMENT" else None,
+        "event_date": data.get("date") or data.get("notified_on"),
+        "published_at": published,
+        "raw_data": json.dumps(event),
+    }
+
+
+async def save_event(conn: aiosqlite.Connection, event: dict[str, Any]) -> None:
+    await conn.execute("""
+        INSERT OR IGNORE INTO company_events (
+            company_number, company_name, event_category, event_type,
+            resource_kind, resource_id, resource_uri, filing_type,
+            filing_description, psc_kind, psc_name, statement_type,
+            event_date, published_at, raw_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, tuple(event.get(k) for k in (
+        "company_number", "company_name", "event_category", "event_type",
+        "resource_kind", "resource_id", "resource_uri", "filing_type",
+        "filing_description", "psc_kind", "psc_name", "statement_type",
+        "event_date", "published_at", "raw_data",
+    )))
+    await conn.commit()
+
+
+async def consume(stream: str, url: str, conn: aiosqlite.Connection) -> None:
+    timepoint_file = Path(f"/data/{stream.lower()}_timepoint.txt")
+    timepoint_file.parent.mkdir(parents=True, exist_ok=True)
+    last = timepoint_file.read_text().strip() if timepoint_file.exists() else None
+
+    while True:
+        try:
+            headers = {"Accept": "application/json"}
+            params = {"timepoint": last} if last else None
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url, params=params, auth=(API_KEY, ""), headers=headers) as response:
+                    if response.status_code != 200:
+                        print(f"{stream} stream returned {response.status_code}", flush=True)
+                        await asyncio.sleep(10)
+                        continue
+                    print(f"Connected to {stream}: {url}", flush=True)
+                    async for line in response.aiter_lines():
+                        if not line or line.startswith("id:") or line.startswith(":"):
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        data = event.get("data") or {}
+                        event_category = category(stream, data)
+                        if event_category:
+                            item = normalise(stream, event, event_category)
+                            if item:
+                                await save_event(conn, item)
+                                print(f"Stored {event_category}: {item['company_number']}", flush=True)
+                        point = event.get("event", {}).get("timepoint")
+                        if point:
+                            last = str(point)
+                            timepoint_file.write_text(last)
+        except Exception as exc:
+            print(f"{stream} error: {exc}", flush=True)
+            await asyncio.sleep(10)
+
+
+async def main() -> None:
+    if not API_KEY:
+        raise RuntimeError("API_KEY is not set")
+    conn = await aiosqlite.connect(DATABASE_FILE)
+    await asyncio.gather(*(consume(name, url, conn) for name, url in STREAMS.items()))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
