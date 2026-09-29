@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,11 +12,20 @@ import httpx
 
 STREAM_API_KEY = os.getenv("STREAM_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 STREAMS = {
     "FILING": os.getenv("FILING_SSE_URL", "https://stream.companieshouse.gov.uk/filings"),
     "PSC": os.getenv("PSC_SSE_URL", "https://stream.companieshouse.gov.uk/persons-with-significant-control"),
     "PSC_STATEMENT": os.getenv("PSC_STATEMENTS_SSE_URL", "https://stream.companieshouse.gov.uk/persons-with-significant-control-statements"),
 }
+COUNTS = Counter()
+CATEGORIES = Counter()
+INVALID_SAMPLES: list[dict[str, Any]] = []
+
+
+def debug(message: str) -> None:
+    if DEBUG_MODE:
+        print(f"[DEBUG] {message}", flush=True)
 
 
 def parse_timestamp(value: Any) -> datetime:
@@ -40,36 +50,29 @@ def valid_company_number(value: Any) -> str | None:
     return None
 
 
-def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
-    direct_values = [
-        data.get("company_number"),
-        event.get("company_number"),
-        data.get("company_registration_number"),
+def company_number(event: dict[str, Any], data: dict[str, Any]) -> tuple[str | None, str | None]:
+    direct = [
+        ("data.company_number", data.get("company_number")),
+        ("event.company_number", event.get("company_number")),
+        ("data.company_registration_number", data.get("company_registration_number")),
     ]
-    for value in direct_values:
+    for source, value in direct:
         candidate = valid_company_number(value)
         if candidate:
-            return candidate
-
+            return candidate, source
     links = data.get("links") or {}
-    for value in (
-        event.get("resource_uri", ""),
-        links.get("self", ""),
-        links.get("company", ""),
-        links.get("company_profile", ""),
-    ):
+    for source, value in [
+        ("event.resource_uri", event.get("resource_uri", "")),
+        ("data.links.self", links.get("self", "")),
+        ("data.links.company", links.get("company", "")),
+        ("data.links.company_profile", links.get("company_profile", "")),
+    ]:
         match = re.search(r"/company/([A-Za-z0-9]+)", str(value))
         if match:
             candidate = valid_company_number(match.group(1))
             if candidate:
-                return candidate
-
-    raw = json.dumps(event)
-    for match in re.finditer(r"(?:/company/|company_number[\"']?\s*[:=]\s*[\"'])([A-Za-z0-9]+)", raw, re.IGNORECASE):
-        candidate = valid_company_number(match.group(1))
-        if candidate:
-            return candidate
-    return None
+                return candidate, source
+    return None, None
 
 
 def category(stream: str, data: dict[str, Any]) -> str | None:
@@ -87,9 +90,20 @@ def category(stream: str, data: dict[str, Any]) -> str | None:
 
 def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[str, Any] | None:
     data = event.get("data") or {}
-    number = company_number(event, data)
+    number, source = company_number(event, data)
     if not number or event.get("event", {}).get("type") == "deleted":
+        COUNTS["invalid_or_deleted"] += 1
+        if len(INVALID_SAMPLES) < 20:
+            INVALID_SAMPLES.append({
+                "stream": stream,
+                "resource_id": event.get("resource_id"),
+                "resource_kind": event.get("resource_kind"),
+                "resource_uri": event.get("resource_uri"),
+                "data_keys": sorted(data.keys()),
+            })
+        debug(f"REJECTED stream={stream} resource_id={event.get('resource_id')} resource_kind={event.get('resource_kind')}")
         return None
+    debug(f"EXTRACTED company_number={number} source={source} category={event_category} resource_id={event.get('resource_id')}")
     metadata = event.get("event") or {}
     return {
         "company_number": number,
@@ -120,7 +134,9 @@ async def save_event(pool: asyncpg.Pool, event: dict[str, Any]) -> bool:
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
         ON CONFLICT(resource_kind, resource_id, event_type) DO NOTHING
     """, event["company_number"], event.get("company_name"), event["event_category"], event.get("event_type"), event.get("resource_kind"), event["resource_id"], event.get("resource_uri"), event.get("filing_type"), event.get("filing_description"), event.get("psc_kind"), event.get("psc_name"), event.get("statement_type"), event.get("event_date"), event["published_at"], event["raw_data"])
-    return result.endswith("1")
+    inserted = result.endswith("1")
+    COUNTS["inserted" if inserted else "duplicates"] += 1
+    return inserted
 
 
 async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
@@ -133,6 +149,7 @@ async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("GET", url, params=params, auth=(STREAM_API_KEY, ""), headers={"Accept": "application/json"}) as response:
                     if response.status_code != 200:
+                        COUNTS[f"http_{response.status_code}"] += 1
                         print(f"{stream} stream returned {response.status_code}", flush=True)
                         await asyncio.sleep(10)
                         continue
@@ -143,18 +160,27 @@ async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
                         try:
                             event = json.loads(line)
                         except json.JSONDecodeError:
+                            COUNTS["invalid_json"] += 1
                             continue
+                        COUNTS["events_seen"] += 1
                         data = event.get("data") or {}
                         event_category = category(stream, data)
                         if event_category:
+                            COUNTS["categorised"] += 1
+                            CATEGORIES[event_category] += 1
                             item = normalise(stream, event, event_category)
                             if item and await save_event(pool, item):
-                                print(f"Stored {event_category}: {item['company_number']}", flush=True)
+                                print(f"Stored {item['event_category']}: {item['company_number']}", flush=True)
+                        else:
+                            COUNTS["uncategorised"] += 1
+                        if COUNTS["events_seen"] % 100 == 0:
+                            debug(f"SUMMARY stream={stream} counts={dict(COUNTS)} categories={dict(CATEGORIES)} invalid_samples={INVALID_SAMPLES[-3:]}")
                         point = event.get("event", {}).get("timepoint")
                         if point:
                             last = str(point)
                             timepoint_file.write_text(last)
         except Exception as exc:
+            COUNTS["exceptions"] += 1
             print(f"{stream} error: {exc}", flush=True)
             await asyncio.sleep(10)
 
