@@ -19,9 +19,55 @@ def utc_now() -> str:
 
 
 def serialise(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return value
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def classify(categories: set[str]) -> str | None:
+    if {"SH01", "NEW_INDIVIDUAL_PSC", "NEW_RLE"}.issubset(categories):
+        return "SH01 + new PSC/RLE"
+    if {"SH01", "NEW_INDIVIDUAL_PSC"}.issubset(categories):
+        return "SH01 + new individual PSC"
+    if {"SH01", "NEW_RLE"}.issubset(categories):
+        return "SH01 + new RLE"
+    if "SH01" in categories:
+        return "SH01 only"
+    if categories & {"NEW_INDIVIDUAL_PSC", "NEW_RLE"}:
+        return "New PSC/RLE only"
+    if "PSC_STATEMENT" in categories:
+        return "PSC statement only"
+    return None
+
+
+async def refresh_company_match(company_number: str) -> None:
+    assert DB_POOL is not None
+    rows = await DB_POOL.fetch("SELECT * FROM company_events WHERE company_number = $1 ORDER BY published_at", company_number)
+    if not rows:
+        return
+    categories = {row["event_category"] for row in rows}
+    classification = classify(categories)
+    if not classification:
+        return
+    await DB_POOL.execute("""
+        INSERT INTO company_matches (company_number, company_name, classification, has_sh01, has_new_individual_psc, has_new_rle, has_psc_statement, first_event_at, latest_event_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT(company_number) DO UPDATE SET
+            company_name=EXCLUDED.company_name, classification=EXCLUDED.classification,
+            has_sh01=EXCLUDED.has_sh01, has_new_individual_psc=EXCLUDED.has_new_individual_psc,
+            has_new_rle=EXCLUDED.has_new_rle, has_psc_statement=EXCLUDED.has_psc_statement,
+            first_event_at=EXCLUDED.first_event_at, latest_event_at=EXCLUDED.latest_event_at,
+            updated_at=EXCLUDED.updated_at
+    """, company_number, rows[-1]["company_name"], classification,
+        "SH01" in categories, "NEW_INDIVIDUAL_PSC" in categories,
+        "NEW_RLE" in categories, "PSC_STATEMENT" in categories,
+        rows[0]["published_at"], rows[-1]["published_at"], datetime.now(timezone.utc))
+
+
+async def backfill_matches() -> int:
+    assert DB_POOL is not None
+    company_numbers = await DB_POOL.fetch("SELECT DISTINCT company_number FROM company_events")
+    for row in company_numbers:
+        await refresh_company_match(row["company_number"])
+    return len(company_numbers)
 
 
 async def initialise_database() -> None:
@@ -60,41 +106,7 @@ async def initialise_database() -> None:
             updated_at TIMESTAMPTZ NOT NULL
         );
     """)
-
-
-async def refresh_company_match(company_number: str) -> None:
-    assert DB_POOL is not None
-    rows = await DB_POOL.fetch("SELECT * FROM company_events WHERE company_number = $1 ORDER BY published_at", company_number)
-    if not rows:
-        return
-    categories = {row["event_category"] for row in rows}
-    if {"SH01", "NEW_INDIVIDUAL_PSC", "NEW_RLE"}.issubset(categories):
-        classification = "SH01 + new PSC/RLE"
-    elif {"SH01", "NEW_INDIVIDUAL_PSC"}.issubset(categories):
-        classification = "SH01 + new individual PSC"
-    elif {"SH01", "NEW_RLE"}.issubset(categories):
-        classification = "SH01 + new RLE"
-    elif "SH01" in categories:
-        classification = "SH01 only"
-    elif categories & {"NEW_INDIVIDUAL_PSC", "NEW_RLE"}:
-        classification = "New PSC/RLE only"
-    elif "PSC_STATEMENT" in categories:
-        classification = "PSC statement only"
-    else:
-        return
-    await DB_POOL.execute("""
-        INSERT INTO company_matches (company_number, company_name, classification, has_sh01, has_new_individual_psc, has_new_rle, has_psc_statement, first_event_at, latest_event_at, updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        ON CONFLICT(company_number) DO UPDATE SET
-            company_name=EXCLUDED.company_name, classification=EXCLUDED.classification,
-            has_sh01=EXCLUDED.has_sh01, has_new_individual_psc=EXCLUDED.has_new_individual_psc,
-            has_new_rle=EXCLUDED.has_new_rle, has_psc_statement=EXCLUDED.has_psc_statement,
-            first_event_at=EXCLUDED.first_event_at, latest_event_at=EXCLUDED.latest_event_at,
-            updated_at=EXCLUDED.updated_at
-    """, company_number, rows[-1]["company_name"], classification,
-        "SH01" in categories, "NEW_INDIVIDUAL_PSC" in categories,
-        "NEW_RLE" in categories, "PSC_STATEMENT" in categories,
-        rows[0]["published_at"], rows[-1]["published_at"], datetime.now(timezone.utc))
+    await backfill_matches()
 
 
 app = FastAPI(title="Companies House Change Monitor")
@@ -128,6 +140,12 @@ async def debug() -> dict[str, Any]:
     match_count = await DB_POOL.fetchval("SELECT COUNT(*) FROM company_matches")
     categories = await DB_POOL.fetch("SELECT event_category, COUNT(*) AS count FROM company_events GROUP BY event_category ORDER BY event_category")
     return {"event_count": event_count, "match_count": match_count, "event_categories": [dict(row) for row in categories]}
+
+
+@app.post("/api/admin/backfill")
+async def admin_backfill() -> dict[str, Any]:
+    count = await backfill_matches()
+    return {"processed_company_numbers": count}
 
 
 @app.get("/api/metrics")
