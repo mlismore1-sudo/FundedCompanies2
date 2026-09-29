@@ -18,20 +18,17 @@ STREAMS = {
 }
 
 
-def now_datetime() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def parse_timestamp(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if not value:
-        return now_datetime()
-    text = str(value).strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return now_datetime()
+        parsed = value
+    elif value:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            parsed = datetime.now(timezone.utc)
+    else:
+        parsed = datetime.now(timezone.utc)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
@@ -64,14 +61,12 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
     number = company_number(event, data)
     if not number or event.get("event", {}).get("type") == "deleted":
         return None
-    event_meta = event.get("event") or {}
-    published = parse_timestamp(event_meta.get("published_at"))
-    event_date = data.get("date") or data.get("notified_on")
+    metadata = event.get("event") or {}
     return {
         "company_number": number,
         "company_name": data.get("company_name") or data.get("name") or data.get("linked_psc_name"),
         "event_category": event_category,
-        "event_type": event_meta.get("type"),
+        "event_type": metadata.get("type"),
         "resource_kind": event.get("resource_kind"),
         "resource_id": event.get("resource_id", "") or number,
         "resource_uri": event.get("resource_uri"),
@@ -80,8 +75,8 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
         "psc_kind": data.get("kind") if stream == "PSC" else None,
         "psc_name": data.get("name") or data.get("linked_psc_name"),
         "statement_type": data.get("statement") if stream == "PSC_STATEMENT" else None,
-        "event_date": str(event_date) if event_date else None,
-        "published_at": published,
+        "event_date": str(data.get("date") or data.get("notified_on") or "") or None,
+        "published_at": parse_timestamp(metadata.get("published_at")),
         "raw_data": json.dumps(event),
     }
 
