@@ -9,19 +9,34 @@ services:
     envVars:
       - key: API_KEY
         sync: false
-      - key: DATABASE_FILE
-        value: /data/companies.db
+      - key: DATABASE_URL
+        sync: false
       - key: FILING_SSE_URL
         value: https://stream.companieshouse.gov.uk/filings
       - key: PSC_SSE_URL
         value: https://stream.companieshouse.gov.uk/persons-with-significant-control
       - key: PSC_STATEMENTS_SSE_URL
-        value: https://stream.companieshouse.gov.uk/persons-with-significant-control-statements
+        sync: false
       - key: PORT
         value: 8000
     healthCheckPath: /health
     autoDeploy: true
-    disk:
-      name: change-monitor-data
-      mountPath: /data
-      sizeGB: 1
+  - type: worker
+    name: companies-house-change-worker
+    env: docker
+    region: frankfurt
+    plan: starter
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python stream_worker.py
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: FILING_SSE_URL
+        value: https://stream.companieshouse.gov.uk/filings
+      - key: PSC_SSE_URL
+        value: https://stream.companieshouse.gov.uk/persons-with-significant-control
+      - key: PSC_STATEMENTS_SSE_URL
+        sync: false
