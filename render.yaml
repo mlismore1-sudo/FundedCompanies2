@@ -1,1 +1,27 @@
-
+services:
+  - type: web
+    name: companies-house-change-monitor
+    env: docker
+    region: frankfurt
+    plan: starter
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: DATABASE_FILE
+        value: /data/companies.db
+      - key: FILING_SSE_URL
+        value: https://stream.companieshouse.gov.uk/filings
+      - key: PSC_SSE_URL
+        value: https://stream.companieshouse.gov.uk/persons-with-significant-control
+      - key: PSC_STATEMENTS_SSE_URL
+        value: https://stream.companieshouse.gov.uk/persons-with-significant-control-statements
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: change-monitor-data
+      mountPath: /data
+      sizeGB: 1
