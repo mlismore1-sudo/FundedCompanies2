@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import os
 import re
@@ -7,11 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
+import asyncpg
 import httpx
 
 API_KEY = os.getenv("API_KEY", "")
-DATABASE_FILE = os.getenv("DATABASE_FILE", "/data/companies.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 STREAMS = {
     "FILING": os.getenv("FILING_SSE_URL", "https://stream.companieshouse.gov.uk/filings"),
     "PSC": os.getenv("PSC_SSE_URL", "https://stream.companieshouse.gov.uk/persons-with-significant-control"),
@@ -42,10 +41,7 @@ def category(stream: str, data: dict[str, Any]) -> str | None:
     kind = str(data.get("kind", "")).lower()
     if "individual-person-with-significant-control" in kind:
         return "NEW_INDIVIDUAL_PSC"
-    if kind in {
-        "corporate-entity-person-with-significant-control",
-        "legal-person-with-significant-control",
-    }:
+    if any(marker in kind for marker in ("corporate-entity", "legal-person", "relevant-legal-entity")):
         return "NEW_RLE"
     return None
 
@@ -55,7 +51,6 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
     number = company_number(event, data)
     if not number or event.get("event", {}).get("type") == "deleted":
         return None
-
     published = event.get("event", {}).get("published_at") or now()
     return {
         "company_number": number,
@@ -76,34 +71,24 @@ def normalise(stream: str, event: dict[str, Any], event_category: str) -> dict[s
     }
 
 
-async def save_event(conn: aiosqlite.Connection, event: dict[str, Any]) -> None:
-    await conn.execute("""
-        INSERT OR IGNORE INTO company_events (
-            company_number, company_name, event_category, event_type,
-            resource_kind, resource_id, resource_uri, filing_type,
-            filing_description, psc_kind, psc_name, statement_type,
-            event_date, published_at, raw_data
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, tuple(event.get(k) for k in (
-        "company_number", "company_name", "event_category", "event_type",
-        "resource_kind", "resource_id", "resource_uri", "filing_type",
-        "filing_description", "psc_kind", "psc_name", "statement_type",
-        "event_date", "published_at", "raw_data",
-    )))
-    await conn.commit()
+async def save_event(pool: asyncpg.Pool, event: dict[str, Any]) -> bool:
+    result = await pool.execute("""
+        INSERT INTO company_events (company_number, company_name, event_category, event_type, resource_kind, resource_id, resource_uri, filing_type, filing_description, psc_kind, psc_name, statement_type, event_date, published_at, raw_data)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+        ON CONFLICT(resource_kind, resource_id, event_type) DO NOTHING
+    """, event["company_number"], event.get("company_name"), event["event_category"], event.get("event_type"), event.get("resource_kind"), event["resource_id"], event.get("resource_uri"), event.get("filing_type"), event.get("filing_description"), event.get("psc_kind"), event.get("psc_name"), event.get("statement_type"), event.get("event_date"), event["published_at"], event["raw_data"])
+    return result.endswith("1")
 
 
-async def consume(stream: str, url: str, conn: aiosqlite.Connection) -> None:
+async def consume(stream: str, url: str, pool: asyncpg.Pool) -> None:
     timepoint_file = Path(f"/data/{stream.lower()}_timepoint.txt")
     timepoint_file.parent.mkdir(parents=True, exist_ok=True)
     last = timepoint_file.read_text().strip() if timepoint_file.exists() else None
-
     while True:
         try:
-            headers = {"Accept": "application/json"}
             params = {"timepoint": last} if last else None
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", url, params=params, auth=(API_KEY, ""), headers=headers) as response:
+                async with client.stream("GET", url, params=params, auth=(API_KEY, ""), headers={"Accept": "application/json"}) as response:
                     if response.status_code != 200:
                         print(f"{stream} stream returned {response.status_code}", flush=True)
                         await asyncio.sleep(10)
@@ -120,8 +105,7 @@ async def consume(stream: str, url: str, conn: aiosqlite.Connection) -> None:
                         event_category = category(stream, data)
                         if event_category:
                             item = normalise(stream, event, event_category)
-                            if item:
-                                await save_event(conn, item)
+                            if item and await save_event(pool, item):
                                 print(f"Stored {event_category}: {item['company_number']}", flush=True)
                         point = event.get("event", {}).get("timepoint")
                         if point:
@@ -135,8 +119,10 @@ async def consume(stream: str, url: str, conn: aiosqlite.Connection) -> None:
 async def main() -> None:
     if not API_KEY:
         raise RuntimeError("API_KEY is not set")
-    conn = await aiosqlite.connect(DATABASE_FILE)
-    await asyncio.gather(*(consume(name, url, conn) for name, url in STREAMS.items()))
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    await asyncio.gather(*(consume(name, url, pool) for name, url in STREAMS.items()))
 
 
 if __name__ == "__main__":
