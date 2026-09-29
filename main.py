@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 from datetime import datetime, timezone
@@ -7,12 +6,11 @@ from typing import Any
 import asyncpg
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", "8000"))
 DB_POOL: asyncpg.Pool | None = None
-SSE_CLIENTS: list[asyncio.Queue] = []
 CLASSIFICATIONS = ["SH01 only", "SH01 + new individual PSC", "SH01 + new RLE", "SH01 + new PSC/RLE", "New PSC/RLE only", "PSC statement only"]
 
 
@@ -20,21 +18,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def classify_company_events(events: list[dict[str, Any]]) -> str | None:
-    categories = {event["event_category"] for event in events}
-    if {"SH01", "NEW_INDIVIDUAL_PSC", "NEW_RLE"}.issubset(categories):
-        return "SH01 + new PSC/RLE"
-    if {"SH01", "NEW_INDIVIDUAL_PSC"}.issubset(categories):
-        return "SH01 + new individual PSC"
-    if {"SH01", "NEW_RLE"}.issubset(categories):
-        return "SH01 + new RLE"
-    if "SH01" in categories:
-        return "SH01 only"
-    if categories & {"NEW_INDIVIDUAL_PSC", "NEW_RLE"}:
-        return "New PSC/RLE only"
-    if "PSC_STATEMENT" in categories:
-        return "PSC statement only"
-    return None
+def serialise(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 async def initialise_database() -> None:
@@ -80,11 +67,21 @@ async def refresh_company_match(company_number: str) -> None:
     rows = await DB_POOL.fetch("SELECT * FROM company_events WHERE company_number = $1 ORDER BY published_at", company_number)
     if not rows:
         return
-    events = [dict(row) for row in rows]
-    classification = classify_company_events(events)
-    if not classification:
+    categories = {row["event_category"] for row in rows}
+    if {"SH01", "NEW_INDIVIDUAL_PSC", "NEW_RLE"}.issubset(categories):
+        classification = "SH01 + new PSC/RLE"
+    elif {"SH01", "NEW_INDIVIDUAL_PSC"}.issubset(categories):
+        classification = "SH01 + new individual PSC"
+    elif {"SH01", "NEW_RLE"}.issubset(categories):
+        classification = "SH01 + new RLE"
+    elif "SH01" in categories:
+        classification = "SH01 only"
+    elif categories & {"NEW_INDIVIDUAL_PSC", "NEW_RLE"}:
+        classification = "New PSC/RLE only"
+    elif "PSC_STATEMENT" in categories:
+        classification = "PSC statement only"
+    else:
         return
-    categories = {event["event_category"] for event in events}
     await DB_POOL.execute("""
         INSERT INTO company_matches (company_number, company_name, classification, has_sh01, has_new_individual_psc, has_new_rle, has_psc_statement, first_event_at, latest_event_at, updated_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
@@ -94,20 +91,10 @@ async def refresh_company_match(company_number: str) -> None:
             has_new_rle=EXCLUDED.has_new_rle, has_psc_statement=EXCLUDED.has_psc_statement,
             first_event_at=EXCLUDED.first_event_at, latest_event_at=EXCLUDED.latest_event_at,
             updated_at=EXCLUDED.updated_at
-    """, company_number, events[-1]["company_name"], classification,
+    """, company_number, rows[-1]["company_name"], classification,
         "SH01" in categories, "NEW_INDIVIDUAL_PSC" in categories,
         "NEW_RLE" in categories, "PSC_STATEMENT" in categories,
-        events[0]["published_at"], events[-1]["published_at"], datetime.now(timezone.utc))
-
-
-async def insert_event(event: dict[str, Any]) -> None:
-    assert DB_POOL is not None
-    await DB_POOL.execute("""
-        INSERT INTO company_events (company_number, company_name, event_category, event_type, resource_kind, resource_id, resource_uri, filing_type, filing_description, psc_kind, psc_name, statement_type, event_date, published_at, raw_data)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
-        ON CONFLICT(resource_kind, resource_id, event_type) DO NOTHING
-    """, event["company_number"], event.get("company_name"), event["event_category"], event.get("event_type"), event.get("resource_kind"), event["resource_id"], event.get("resource_uri"), event.get("filing_type"), event.get("filing_description"), event.get("psc_kind"), event.get("psc_name"), event.get("statement_type"), event.get("event_date"), event["published_at"], event["raw_data"])
-    await refresh_company_match(event["company_number"])
+        rows[0]["published_at"], rows[-1]["published_at"], datetime.now(timezone.utc))
 
 
 app = FastAPI(title="Companies House Change Monitor")
@@ -134,6 +121,15 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": utc_now()}
 
 
+@app.get("/api/debug")
+async def debug() -> dict[str, Any]:
+    assert DB_POOL is not None
+    event_count = await DB_POOL.fetchval("SELECT COUNT(*) FROM company_events")
+    match_count = await DB_POOL.fetchval("SELECT COUNT(*) FROM company_matches")
+    categories = await DB_POOL.fetch("SELECT event_category, COUNT(*) AS count FROM company_events GROUP BY event_category ORDER BY event_category")
+    return {"event_count": event_count, "match_count": match_count, "event_categories": [dict(row) for row in categories]}
+
+
 @app.get("/api/metrics")
 async def metrics() -> dict[str, Any]:
     assert DB_POOL is not None
@@ -153,11 +149,8 @@ async def companies(limit: int = Query(100, ge=1, le=1000), classification: str 
         rows = await DB_POOL.fetch("SELECT * FROM company_matches ORDER BY latest_event_at DESC LIMIT $1", limit)
     result = []
     for row in rows:
-        item = dict(row)
+        item = {key: serialise(value) for key, value in dict(row).items()}
         item["companies_house_url"] = f"https://find-and-update.company-information.service.gov.uk/company/{row['company_number']}"
-        for key, value in list(item.items()):
-            if hasattr(value, "isoformat"):
-                item[key] = value.isoformat()
         result.append(item)
     return {"companies": result, "count": len(result)}
 
@@ -166,33 +159,12 @@ async def companies(limit: int = Query(100, ge=1, le=1000), classification: str 
 async def company_events(company_number: str) -> dict[str, Any]:
     assert DB_POOL is not None
     rows = await DB_POOL.fetch("SELECT * FROM company_events WHERE company_number = $1 ORDER BY published_at DESC", company_number)
-    events = []
-    for row in rows:
-        item = dict(row)
-        for key, value in list(item.items()):
-            if hasattr(value, "isoformat"):
-                item[key] = value.isoformat()
-        events.append(item)
-    return {"company_number": company_number, "events": events}
-
-
-@app.get("/stream")
-async def stream() -> StreamingResponse:
-    queue: asyncio.Queue = asyncio.Queue()
-    SSE_CLIENTS.append(queue)
-    async def generate():
-        try:
-            while True:
-                yield f"data: {json.dumps(await queue.get())}\n\n"
-        finally:
-            if queue in SSE_CLIENTS:
-                SSE_CLIENTS.remove(queue)
-    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return {"company_number": company_number, "events": [{key: serialise(value) for key, value in dict(row).items()} for row in rows]}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
-    return """<!doctype html><html><head><meta charset='utf-8'><title>Companies House Change Monitor</title><style>body{font-family:Arial;margin:24px;color:#172033}table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#f3f4f6}.pill{padding:4px 7px;border-radius:12px;background:#e0e7ff}.toolbar{display:flex;gap:10px;margin:15px 0}button,select{padding:8px}</style></head><body><h1>Companies House Change Monitor</h1><div id='metrics'></div><div class='toolbar'><select id='classification'><option value=''>All classifications</option></select><button onclick='load()'>Refresh</button></div><table><thead><tr><th>Company</th><th>Classification</th><th>Latest event</th><th>Companies House</th></tr></thead><tbody id='rows'></tbody></table><script>const cs=['SH01 only','SH01 + new individual PSC','SH01 + new RLE','SH01 + new PSC/RLE','New PSC/RLE only','PSC statement only'];for(const c of cs){let o=document.createElement('option');o.value=c;o.textContent=c;classification.appendChild(o)}async function load(){let c=classification.value;let d=await(await fetch('/api/companies?limit=250'+(c?'&classification='+encodeURIComponent(c):''))).json();rows.innerHTML=d.companies.map(x=>`<tr><td><a href='/api/companies/${x.company_number}/events'>${x.company_name||''}</a><br><small>${x.company_number}</small></td><td><span class='pill'>${x.classification}</span></td><td>${x.latest_event_at||''}</td><td><a target='_blank' href='${x.companies_house_url}'>Open</a></td></tr>`).join('');let m=await(await fetch('/api/metrics')).json();metrics.textContent='Total matched companies: '+m.total+' | '+Object.entries(m.counts).map(([k,v])=>k+': '+v).join(' | ')}load();setInterval(load,30000);new EventSource('/stream').onmessage=load;</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><title>Companies House Change Monitor</title><style>body{font-family:Arial;margin:24px;color:#172033}table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#f3f4f6}.pill{padding:4px 7px;border-radius:12px;background:#e0e7ff}.toolbar{display:flex;gap:10px;margin:15px 0}button,select{padding:8px}</style></head><body><h1>Companies House Change Monitor</h1><div id='metrics'></div><div class='toolbar'><select id='classification'><option value=''>All classifications</option></select><button onclick='load()'>Refresh</button></div><table><thead><tr><th>Company</th><th>Classification</th><th>Latest event</th><th>Companies House</th></tr></thead><tbody id='rows'></tbody></table><script>const cs=['SH01 only','SH01 + new individual PSC','SH01 + new RLE','SH01 + new PSC/RLE','New PSC/RLE only','PSC statement only'];for(const c of cs){let o=document.createElement('option');o.value=c;o.textContent=c;document.querySelector('#classification').appendChild(o)}async function load(){let c=document.querySelector('#classification').value;let d=await(await fetch('/api/companies?limit=250'+(c?'&classification='+encodeURIComponent(c):''))).json();document.querySelector('#rows').innerHTML=d.companies.map(x=>`<tr><td><a href='/api/companies/${x.company_number}/events'>${x.company_name||''}</a><br><small>${x.company_number}</small></td><td><span class='pill'>${x.classification}</span></td><td>${x.latest_event_at||''}</td><td><a target='_blank' href='${x.companies_house_url}'>Open</a></td></tr>`).join('');let m=await(await fetch('/api/metrics')).json();document.querySelector('#metrics').textContent='Total matched companies: '+m.total+' | '+Object.entries(m.counts).map(([k,v])=>k+': '+v).join(' | ')}load();setInterval(load,30000);</script></body></html>"""
 
 
 if __name__ == "__main__":
