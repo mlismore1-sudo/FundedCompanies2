@@ -31,19 +31,44 @@ def parse_timestamp(value: Any) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def valid_company_number(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = re.sub(r"\s+", "", str(value).strip().upper()).replace("/", "")
+    if re.fullmatch(r"\d{8}", text) or re.fullmatch(r"[A-Z]{2}\d{6}", text):
+        return text
+    return None
+
+
 def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
-    for source in (data, event):
-        value = source.get("company_number")
-        if value:
-            value = str(value).strip().upper()
-            if re.fullmatch(r"\d{8}", value) or re.fullmatch(r"[A-Z]{2}\d{6}", value):
-                return value
-    for value in (event.get("resource_uri", ""), data.get("links", {}).get("self", "")):
-        match = re.search(r"/company/([A-Za-z0-9]+)", value)
+    direct_values = [
+        data.get("company_number"),
+        event.get("company_number"),
+        data.get("company_registration_number"),
+    ]
+    for value in direct_values:
+        candidate = valid_company_number(value)
+        if candidate:
+            return candidate
+
+    links = data.get("links") or {}
+    for value in (
+        event.get("resource_uri", ""),
+        links.get("self", ""),
+        links.get("company", ""),
+        links.get("company_profile", ""),
+    ):
+        match = re.search(r"/company/([A-Za-z0-9]+)", str(value))
         if match:
-            candidate = match.group(1).upper()
-            if re.fullmatch(r"\d{8}", candidate) or re.fullmatch(r"[A-Z]{2}\d{6}", candidate):
+            candidate = valid_company_number(match.group(1))
+            if candidate:
                 return candidate
+
+    raw = json.dumps(event)
+    for match in re.finditer(r"(?:/company/|company_number[\"']?\s*[:=]\s*[\"'])([A-Za-z0-9]+)", raw, re.IGNORECASE):
+        candidate = valid_company_number(match.group(1))
+        if candidate:
+            return candidate
     return None
 
 
