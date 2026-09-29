@@ -22,9 +22,8 @@ def parse_timestamp(value: Any) -> datetime:
     if isinstance(value, datetime):
         parsed = value
     elif value:
-        text = str(value).strip().replace("Z", "+00:00")
         try:
-            parsed = datetime.fromisoformat(text)
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         except ValueError:
             parsed = datetime.now(timezone.utc)
     else:
@@ -34,8 +33,11 @@ def parse_timestamp(value: Any) -> datetime:
 
 def company_number(event: dict[str, Any], data: dict[str, Any]) -> str | None:
     for source in (data, event):
-        if source.get("company_number"):
-            return str(source["company_number"])
+        value = source.get("company_number")
+        if value:
+            value = str(value)
+            if re.fullmatch(r"\d{8}", value) or re.fullmatch(r"[A-Z]{2}\d{6}", value):
+                return value
     for value in (event.get("resource_uri", ""), data.get("links", {}).get("self", "")):
         match = re.search(r"/company/([A-Za-z0-9]+)", value)
         if match:
