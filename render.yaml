@@ -7,7 +7,7 @@ services:
     dockerContext: .
     dockerfilePath: ./Dockerfile
     envVars:
-      - key: API_KEY
+      - key: REST_API_KEY
         sync: false
       - key: DATABASE_URL
         sync: false
@@ -30,7 +30,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerCommand: python stream_worker.py
     envVars:
-      - key: API_KEY
+      - key: STREAM_API_KEY
         sync: false
       - key: DATABASE_URL
         sync: false
